@@ -82,7 +82,7 @@ class GpsFollower(Node):
 
         self.last_apriltag_time = 0.0
         self.latest_apriltag_pose = None
-        self.fixed_altitude = 10.0
+        self.fixed_altitude = 7.0
         self.last_lat, self.last_lon = None, None
         self.uav_lat, self.uav_lon = None, None
         self.last_time = time.time()
@@ -250,17 +250,32 @@ class GpsFollower(Node):
         """Returns a new GPS point (lat, lon) offset by distance_m *behind* bearing_rad.
         """
         R = 6378137.0  # Earth radius in meters
-        bearing = bearing_rad + math.pi  # Opposite direction
+        bearing = bearing_rad  # Right direction
+
+        if bearing < 0 and bearing > 90:
+            lat_distance_offset =  distance_m * math.sin(bearing)
+            lon_distance_offset = distance_m * math.cos(bearing)
+
+        elif bearing > 90 and bearing < 180:
+            lat_distance_offset = -distance_m * math.sin(180 - bearing)
+            lon_distance_offset = distance_m * math.cos(180 - bearing)
+        
+        elif bearing > -90 and bearing < 0:
+            lat_distance_offset = distance_m * math.cos(-bearing)
+            lon_distance_offset = distance_m * math.sin(-bearing)
+        else:
+            lat_distance_offset = -distance_m * math.cos(180 + bearing)
+            lon_distance_offset = -distance_m * math.sin(180 + bearing)
+        
 
         new_lat = math.asin(
-            math.sin(math.radians(lat)) * math.cos(distance_m / R) +
-            math.cos(math.radians(lat)) * math.sin(distance_m / R) * math.cos(bearing)
+            math.sin(math.radians(lat)) * math.cos(lat_distance_offset / R) +
+            math.cos(math.radians(lat)) * math.sin(lat_distance_offset / R) * math.cos(bearing)
         )
         new_lon = math.radians(lon) + math.atan2(
-            math.sin(bearing) * math.sin(distance_m / R) * math.cos(math.radians(lat)),
-            math.cos(distance_m / R) - math.sin(math.radians(lat)) * math.sin(new_lat)
+            math.sin(bearing) * math.sin(lon_distance_offset / R) * math.cos(math.radians(lat)),
+            math.cos(lon_distance_offset / R) - math.sin(math.radians(lat)) * math.sin(new_lat)
         )
-
         return math.degrees(new_lat), math.degrees(new_lon)
     
     def projected_distance_along_heading(self, car_lat, car_lon, car_heading_rad, uav_lat, uav_lon):
@@ -325,13 +340,18 @@ class GpsFollower(Node):
             rate = 0.2  # 5 Hz
             while rclpy.ok():
                 if self.last_lat is not None:
-                    target = LocationGlobalRelative(self.last_lat, self.last_lon, self.fixed_altitude)
+                    # Fake target = 40m ahead of car
+                    car_heading_rad = getattr(self, "last_car_heading", math.radians(self.target_heading_deg))
+                    spoof_lat, spoof_lon = self.offset_gps(self.last_lat, self.last_lon, car_heading_rad, -20.0)
+
+                    target = LocationGlobalRelative(spoof_lat, spoof_lon, self.fixed_altitude)
                     self.vehicle.simple_goto(target)
                 time.sleep(rate)
 
         thread = threading.Thread(target=send_goto_loop)
         thread.daemon = True
         thread.start()
+
 
     def attitude_loop(self):
         log_counter = 0
@@ -341,7 +361,7 @@ class GpsFollower(Node):
             self.last_time = now
             elapsed = now - self.start_time
 
-            if self.last_lat is None or self.last_lon is None or (now - self.start_time) < 23.0:
+            if self.last_lat is None or self.last_lon is None or (now - self.start_time) < 30.0:
                 time.sleep(0.01)
                 continue
 
@@ -352,7 +372,7 @@ class GpsFollower(Node):
             now = time.time()
             pose0, t0 = self.latest_tags.get(0, (None, 0.0))
             pose1, t1 = self.latest_tags.get(1, (None, 0.0))
-            desired_distance = 15.00
+            desired_distance = 1.00
 
             use_pose = None
             tag_source = "GPS"
@@ -437,9 +457,7 @@ class GpsFollower(Node):
                 self.log_roll_cmd.append(math.degrees(roll_cmd))
                 self.log_lateral_offset.append(lateral_error)
 
-            
-
-            # --- Attitude Command ---
+            #--- Attitude Command ---#
             q = euler_to_quaternion(roll_cmd, pitch_cmd, 0.0)
             self.vehicle._master.mav.set_attitude_target_send(
                 int((now - self.start_time) * 1000),
@@ -451,11 +469,51 @@ class GpsFollower(Node):
                 throttle_cmd
             )
 
+            # # --- Send MAVLINK_MSG_ID_SET_TECS_EXTERNAL_NAV (ID 187) ---
+            # self.vehicle._master.mav.command_int_send(
+            #     self.vehicle._master.target_system,
+            #     self.vehicle._master.target_component,
+            #     mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+            #     43008,  # MAV_CMD_SET_TECS_EXTERNAL_NAV
+            #     0, 0,     # confirmation
+            #     float(target_airspeed),  # ✅ param1: desired EAS in m/s
+            #     float(self.fixed_altitude),  # ✅ param2: desired altitude (AGL)
+            #     1, 0, 0, 0, 0                         # param3 = enable, rest unused
+            # )
+            # self.vehicle._master.mav.command_long_send(
+            #     self.vehicle._master.target_system,
+            #     self.vehicle._master.target_component,
+            #     43008,  # MAV_CMD_SET_TECS_EXTERNAL_NAV
+            #     0,
+            #     float(target_airspeed),  # ✅ param1: desired EAS in m/s
+            #     float(self.fixed_altitude),  # ✅ param2: desired altitude (AGL)
+            #     1, 0, 0, 0, 0             # param3 = enable, rest unused
+            # )
+
+            # --- Compute spoofed forward distance (fake L1) ---
+            car_heading = self.last_car_heading if hasattr(self, "last_car_heading") else math.radians(self.target_heading_deg)
+            spoofed_forward_distance = dist_to_target + 50.0  # push target 40m ahead for L1 logic
+            # --- Send MAV_CMD_SET_L1_EXTERNAL_NAV ---
+            self.vehicle._master.mav.command_int_send(
+                self.vehicle._master.target_system,
+                self.vehicle._master.target_component,
+                mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+                43007,
+                0, 0,  # current, autocontinue
+                float(lateral_error),      # param1: crosstrack error (left/right, + = left)
+                float(spoofed_forward_distance),     # param2: forward distance (m)
+                1,                         # param3: enable (1), disable (0)
+                0, 0,                      # param4-5 unused
+                0, 0                       # param6-7 unused
+            )
+
+
             if log_counter % 10 == 0:
                 self.get_logger().info(
                     f"[{tag_source}] Dist: {dist_to_target:.2f}m | TgtAS: {target_airspeed:.2f} | AS: {airspeed:.2f} | "
                     f"Alt: {altitude:.2f} | Throttle: {throttle_cmd:.2f} | Pitch(deg): {math.degrees(pitch_cmd):.2f} | "
                     f"Lateral Offset: {lateral_error:.2f}m | RollCmd: {math.degrees(roll_cmd):.2f}°"
+                    f"Bearing Car: {math.degrees(car_heading):.2f}° | "
                 )
             log_counter += 1
             time.sleep(0.01)

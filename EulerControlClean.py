@@ -318,7 +318,7 @@ class GpsFollower(Node):
                 self.log_lateral_offset.append(lateral_error)
 
             # --- Attitude Command ---
-            q = euler_to_quaternion(32767, pitch_cmd, 3)
+            q = euler_to_quaternion(roll_cmd, pitch_cmd, 3)
             self.vehicle._master.mav.set_attitude_target_send(
                 int((now - self.start_time) * 1000),
                 self.vehicle._master.target_system,
