@@ -346,12 +346,21 @@ class GpsFollower(Node):
 
     def start_gps_thread(self):
         def send_goto_loop():
+            start_time = time.time()
             rate = 0.2  # 5 Hz
             while rclpy.ok():
                 if self.last_lat is not None:
-                    # Fake target = 40m ahead of car
+                    elapsed = time.time() - start_time
+
                     car_heading_rad = getattr(self, "last_car_heading", math.radians(self.target_heading_deg))
-                    target = LocationGlobalRelative(self.last_lat, self.last_lon, self.fixed_altitude)
+
+                    if elapsed >= 5.0:
+                        # Offset 50m forward after 5 seconds
+                        spoof_lat, spoof_lon = self.offset_gps(self.last_lat, self.last_lon, car_heading_rad, 50.0)
+                    else:
+                        spoof_lat, spoof_lon = self.last_lat, self.last_lon
+
+                    target = LocationGlobalRelative(spoof_lat, spoof_lon, self.fixed_altitude)
                     self.vehicle.simple_goto(target)
                 time.sleep(rate)
 

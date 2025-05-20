@@ -79,7 +79,6 @@ class GpsFollower(Node):
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 15)
         self.create_subscription(NavSatFix, '/prius/gps', self.gps_callback, 10)
         self.create_subscription(TagPoseStamped, '/apriltag/pose_in_base', self.apriltag_callback, 10)
-        self.last_car_heading = math.radians(self.target_heading_deg)
 
         self.last_apriltag_time = 0.0
         self.latest_apriltag_pose = None
@@ -109,6 +108,7 @@ class GpsFollower(Node):
         #self.lateral_pid = PID(kp=0.0018, ki=0.0007, kd=0.11, integral_limit=1.2)
 
         self.target_heading_deg = 105.5  # Set desired heading here
+        self.last_car_heading = math.radians(self.target_heading_deg)
         self.log_roll_cmd = []
         self.log_time = []
         self.log_distance_error = []
@@ -500,15 +500,25 @@ class GpsFollower(Node):
                 self.log_lateral_offset.append(lateral_error)
 
             #--- Attitude Command ---#
-            q = euler_to_quaternion(roll_cmd, pitch_cmd, 0.0)
-            self.vehicle._master.mav.set_attitude_target_send(
-                int((now - self.start_time) * 1000),
+            # q = euler_to_quaternion(roll_cmd, pitch_cmd, 0.0)
+            # self.vehicle._master.mav.set_attitude_target_send(
+            #     int((now - self.start_time) * 1000),
+            #     self.vehicle._master.target_system,
+            #     self.vehicle._master.target_component,
+            #     0b00000100,
+            #     q,
+            #     0.0, 0.0, 0.0,
+            #     throttle_cmd
+            # )
+
+            self.vehicle._master.mav.command_long_send(
                 self.vehicle._master.target_system,
                 self.vehicle._master.target_component,
-                0b00000100,
-                q,
-                0.0, 0.0, 0.0,
-                throttle_cmd
+                mavutil.mavlink.MAV_CMD_DO_CHANGE_SPEED,
+                0,
+                0,  # Airspeed
+                target_airspeed,
+                -1, 0, 0, 0, 0
             )
 
             # # --- Send MAVLINK_MSG_ID_SET_TECS_EXTERNAL_NAV (ID 187) ---
