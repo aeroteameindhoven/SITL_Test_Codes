@@ -363,11 +363,21 @@ class GpsFollower(Node):
 
     def start_gps_thread(self):
         def send_goto_loop():
+            start_time = time.time()
             rate = 0.2  # 5 Hz
             while rclpy.ok():
                 if self.last_lat is not None:
-                    # Fake target = 40m ahead of car
+                    elapsed = time.time() - start_time
+
                     car_heading_rad = getattr(self, "last_car_heading", math.radians(self.target_heading_deg))
+
+                    if elapsed >= 5.0:
+                        spoof_lat, spoof_lon = self.offset_gps(self.last_lat, self.last_lon, self.last_car_heading, 50.0)
+                        # Replace vehicle.simple_goto or SET_POSITION_TARGET with this spoof
+                        self.vehicle.simple_goto(LocationGlobalRelative(spoof_lat, spoof_lon, self.fixed_altitude))
+                    else:
+                        spoof_lat, spoof_lon = self.last_lat, self.last_lon
+
                     target = LocationGlobalRelative(self.last_lat, self.last_lon, self.fixed_altitude)
                     self.vehicle.simple_goto(target)
                 time.sleep(rate)
@@ -500,26 +510,26 @@ class GpsFollower(Node):
                 self.log_lateral_offset.append(lateral_error)
 
             #--- Attitude Command ---#
-            # q = euler_to_quaternion(roll_cmd, pitch_cmd, 0.0)
-            # self.vehicle._master.mav.set_attitude_target_send(
-            #     int((now - self.start_time) * 1000),
-            #     self.vehicle._master.target_system,
-            #     self.vehicle._master.target_component,
-            #     0b00000100,
-            #     q,
-            #     0.0, 0.0, 0.0,
-            #     throttle_cmd
-            # )
-
-            self.vehicle._master.mav.command_long_send(
+            q = euler_to_quaternion(roll_cmd, pitch_cmd, 0.0)
+            self.vehicle._master.mav.set_attitude_target_send(
+                int((now - self.start_time) * 1000),
                 self.vehicle._master.target_system,
                 self.vehicle._master.target_component,
-                mavutil.mavlink.MAV_CMD_DO_CHANGE_SPEED,
-                0,
-                0,  # Airspeed
-                target_airspeed,
-                -1, 0, 0, 0, 0
+                0b00000100,
+                q,
+                0.0, 0.0, 0.0,
+                throttle_cmd
             )
+
+            # self.vehicle._master.mav.command_long_send(
+            #     self.vehicle._master.target_system,
+            #     self.vehicle._master.target_component,
+            #     mavutil.mavlink.MAV_CMD_DO_CHANGE_SPEED,
+            #     0,
+            #     0,  # Airspeed
+            #     target_airspeed,
+            #     -1, 0, 0, 0, 0
+            # )
 
             # # --- Send MAVLINK_MSG_ID_SET_TECS_EXTERNAL_NAV (ID 187) ---
             # self.vehicle._master.mav.command_int_send(

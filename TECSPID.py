@@ -355,12 +355,13 @@ class GpsFollower(Node):
                     car_heading_rad = getattr(self, "last_car_heading", math.radians(self.target_heading_deg))
 
                     if elapsed >= 5.0:
-                        # Offset 50m forward after 5 seconds
-                        spoof_lat, spoof_lon = self.offset_gps(self.last_lat, self.last_lon, car_heading_rad, 50.0)
+                        spoof_lat, spoof_lon = self.offset_gps(self.last_lat, self.last_lon, self.last_car_heading, 50.0)
+                        # Replace vehicle.simple_goto or SET_POSITION_TARGET with this spoof
+                        self.vehicle.simple_goto(LocationGlobalRelative(spoof_lat, spoof_lon, self.fixed_altitude))
                     else:
                         spoof_lat, spoof_lon = self.last_lat, self.last_lon
 
-                    target = LocationGlobalRelative(spoof_lat, spoof_lon, self.fixed_altitude)
+                    target = LocationGlobalRelative(self.last_lat, self.last_lon, self.fixed_altitude)
                     self.vehicle.simple_goto(target)
                 time.sleep(rate)
 
