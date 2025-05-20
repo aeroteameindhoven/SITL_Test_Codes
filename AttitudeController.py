@@ -71,6 +71,7 @@ class GpsFollower(Node):
         self.trajectory_target_alt = 3.0
         self.trajectory_target_dist = 3.0
         self.desired_distance = 15.0
+        self.prev_tag_source = "GPS"
         self.trajectory_hold_duration = 20.0  # maintain 5m alt & dist for 20s
 
         self.prius_last_lat = None
@@ -147,22 +148,28 @@ class GpsFollower(Node):
         self.latest_tags[tag_id] = (msg.pose, time.time())
 
     def offset_gps(self, lat, lon, bearing_rad, distance_m):
-    
-        """Returns a new GPS point (lat, lon) offset by distance_m *behind* bearing_rad.
+        """
+        Offsets the given lat/lon by distance_m *forward* in the bearing_rad direction.
+        Returns new (lat, lon).
         """
         R = 6378137.0  # Earth radius in meters
-        bearing = bearing_rad + math.pi  # Opposite direction
+        lat1 = math.radians(lat)
+        lon1 = math.radians(lon)
+
+        d_by_r = distance_m / R
 
         new_lat = math.asin(
-            math.sin(math.radians(lat)) * math.cos(distance_m / R) +
-            math.cos(math.radians(lat)) * math.sin(distance_m / R) * math.cos(bearing)
+            math.sin(lat1) * math.cos(d_by_r) +
+            math.cos(lat1) * math.sin(d_by_r) * math.cos(bearing_rad)
         )
-        new_lon = math.radians(lon) + math.atan2(
-            math.sin(bearing) * math.sin(distance_m / R) * math.cos(math.radians(lat)),
-            math.cos(distance_m / R) - math.sin(math.radians(lat)) * math.sin(new_lat)
+
+        new_lon = lon1 + math.atan2(
+            math.sin(bearing_rad) * math.sin(d_by_r) * math.cos(lat1),
+            math.cos(d_by_r) - math.sin(lat1) * math.sin(new_lat)
         )
 
         return math.degrees(new_lat), math.degrees(new_lon)
+
     
     def projected_distance_along_heading(self, car_lat, car_lon, car_heading_rad, uav_lat, uav_lon):
         """
@@ -220,12 +227,20 @@ class GpsFollower(Node):
     def wrap_angle_rad(self, angle):
         """Wrap angle to [-π, π]"""
         return ((angle + math.pi) % (2 * math.pi)) - math.pi 
+    
+    def send_custom_l1_external_nav(self, xtrack_error, wp_distance, enable):
+        self.vehicle._master.mav.l1_external_nav_send(
+            xtrack_error,     # param1: cross-track error (left/right)
+            wp_distance,      # param2: distance to WP
+            enable            # param3: 1=enable, 0=disable
+        )
 
     def start_gps_thread(self):
         def send_goto_loop():
             rate = 0.2  # 5 Hz
             while rclpy.ok():
                 if self.last_lat is not None:
+                    car_heading_rad = getattr(self, "last_car_heading", math.radians(self.target_heading_deg))
                     target = LocationGlobalRelative(self.last_lat, self.last_lon, self.fixed_altitude)
                     self.vehicle.simple_goto(target)
                 time.sleep(rate)
@@ -253,16 +268,29 @@ class GpsFollower(Node):
             now = time.time()
             pose0, t0 = self.latest_tags.get(0, (None, 0.0))
             pose1, t1 = self.latest_tags.get(1, (None, 0.0))
+            desired_distance = 10.0 if elapsed < 100.0 else 6.0
 
             use_pose = None
             tag_source = "GPS"
 
-            if now - t0 < 0.5:
+            valid_time_window = 1.0  # seconds
+
+            # --- Determine best valid AprilTag pose ---
+            if now - t0 < valid_time_window:
                 use_pose = pose0
                 tag_source = "AprilTag ID 0"
-            elif now - t1 < 0.5:
+            elif now - t1 < valid_time_window:
                 use_pose = pose1
                 tag_source = "AprilTag ID 1"
+
+            # --- If not fresh, use last one briefly ---
+            elif t0 > t1 and (now - t0) < 1.5:
+                use_pose = pose0
+                tag_source = "Stale AprilTag ID 0"
+            elif t1 > t0 and (now - t1) < 1.5:
+                use_pose = pose1
+                tag_source = "Stale AprilTag ID 1"
+
 
             in_trajectory_phase = self.run_duration < elapsed <= self.run_duration + self.trajectory_duration
             in_hold_phase = self.run_duration + self.trajectory_duration < elapsed <= self.run_duration + self.trajectory_duration + self.trajectory_hold_duration
@@ -281,9 +309,16 @@ class GpsFollower(Node):
 
             # Use Tag or fallback to GPS
             if use_pose is not None:
+                spoof_lat, spoof_lon = self.offset_gps(self.last_lat, self.last_lon, self.last_car_heading, 50.0)
+                # Replace vehicle.simple_goto or SET_POSITION_TARGET with this spoof
+                self.vehicle.simple_goto(LocationGlobalRelative(spoof_lat, spoof_lon, self.fixed_altitude))
+                tag_source = "AprilTag ID 0" if now - t0 < 0.5 else "AprilTag ID 1"
+                if self.prev_tag_source != tag_source:
+                    self.distance_pid.integral = 0.0
+                    self.distance_pid.last_error = 0.0
                 lateral_error = use_pose.pose.position.x
                 altitude_error = self.fixed_altitude - (self.vehicle.location.global_relative_frame.alt or 0.0)
-                distance_error = use_pose.pose.position.z - self.desired_distance
+                distance_error = use_pose.pose.position.z - desired_distance
                 dist_to_target = use_pose.pose.position.z
             else:
                 tag_source = "GPS"
@@ -385,6 +420,22 @@ class GpsFollower(Node):
                 0.0, 0.0, 0.0,
                 throttle_cmd
             )
+            spoofed_forward_distance = 500 # push target 40m ahead for L1 logic
+            # # --- Send MAV_CMD_SET_L1_EXTERNAL_NAV ---
+            # self.vehicle._master.mav.command_int_send(
+            #     self.vehicle._master.target_system,
+            #     self.vehicle._master.target_component,
+            #     mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+            #     43007,
+            #     0, 0,  # current, autocontinue
+            #     float(lateral_error),      # param1: crosstrack error (left/right, + = left)
+            #     float(spoofed_forward_distance),     # param2: forward distance (m)
+            #     1,                         # param3: enable (1), disable (0)
+            #     0, 0,                      # param4-5 unused
+            #     0, 0                       # param6-7 unused
+            # )
+
+            self.send_custom_l1_external_nav(float(lateral_error), float(spoofed_forward_distance), 1)
 
             if log_counter % 10 == 0:
                 self.get_logger().info(
