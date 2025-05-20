@@ -79,6 +79,7 @@ class GpsFollower(Node):
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 15)
         self.create_subscription(NavSatFix, '/prius/gps', self.gps_callback, 10)
         self.create_subscription(TagPoseStamped, '/apriltag/pose_in_base', self.apriltag_callback, 10)
+        self.last_car_heading = math.radians(self.target_heading_deg)
 
         self.last_apriltag_time = 0.0
         self.latest_apriltag_pose = None
