@@ -265,34 +265,33 @@ class GpsFollower(Node):
             altitude = self.vehicle.location.global_relative_frame.alt or 0.0
             airspeed = self.vehicle.airspeed or 0.0
             now = time.time()
-            pose0, t0 = self.latest_tags.get(0, (None, 0.0))
-            pose1, t1 = self.latest_tags.get(1, (None, 0.0))
             desired_distance = 10.0 if elapsed < 100.0 else 0.0
-
             use_pose = None
             tag_source = "GPS"
-
             valid_time_window = 1.0  # seconds
+            stale_window = 1.5       # extended stale fallback
 
-            # --- Determine best valid AprilTag pose ---
-            if now - t0 < valid_time_window:
-                use_pose = pose0
-                tag_source = "AprilTag ID 0"
-            elif now - t1 < valid_time_window:
-                use_pose = pose1
-                tag_source = "AprilTag ID 1"
+            # --- Collect tag data (pose, timestamp) ---
+            tag_data = [(id, *self.latest_tags.get(id, (None, 0.0))) for id in [4, 3, 2, 1, 0]]
 
-            # --- If not fresh, use last one briefly ---
-            elif t0 > t1 and (now - t0) < 1.5:
-                use_pose = pose0
-                tag_source = "Stale AprilTag ID 0"
-            elif t1 > t0 and (now - t1) < 1.5:
-                use_pose = pose1
-                tag_source = "Stale AprilTag ID 1"
-            
+            # --- Try valid/fresh detections first ---
+            for tag_id, pose, t in tag_data:
+                if now - t < valid_time_window:
+                    use_pose = pose
+                    tag_source = f"AprilTag ID {tag_id}"
+                    break
+
+            # --- If no fresh tag, try stale (within stale_window) ---
+            if use_pose is None:
+                # sort by freshest timestamp first
+                tag_data_sorted = sorted(tag_data, key=lambda x: x[2], reverse=True)
+                for tag_id, pose, t in tag_data_sorted:
+                    if now - t < stale_window:
+                        use_pose = pose
+                        tag_source = f"Stale AprilTag ID {tag_id}"
+                        break
+
             if use_pose is not None:
-                
-                tag_source = "AprilTag ID 0" if now - t0 < 0.5 else "AprilTag ID 1"
                 if self.prev_tag_source != tag_source:
                     self.distance_pid.integral = 0.0
                     self.distance_pid.last_error = 0.0
@@ -300,7 +299,6 @@ class GpsFollower(Node):
                 altitude_error = self.fixed_altitude - (self.vehicle.location.global_relative_frame.alt or 0.0)
                 distance_error = use_pose.pose.position.z - desired_distance
                 dist_to_target = use_pose.pose.position.z
-
             else:
                 tag_source = "GPS"
                 if self.prius_last_lat is not None and self.prius_last_lon is not None:
@@ -309,7 +307,6 @@ class GpsFollower(Node):
                 distance_error = dist_to_target - desired_distance
                 lateral_error = self.lateral_offset_error(self.last_lat, self.last_lon, self.car_heading_radians, self.uav_lat, self.uav_lon)
                 altitude_error = self.fixed_altitude - (self.vehicle.location.global_relative_frame.alt or 0.0)
-
             self.prev_dist = dist_to_target
 
             if elapsed > self.run_duration:
@@ -378,9 +375,6 @@ class GpsFollower(Node):
 
             self.send_custom_l1_external_nav(float(lateral_error), float(spoofed_forward_distance), 1)
 
-
-
-# Compute spoofed GPS 20m ahead of car for display only
             if log_counter % 10 == 0:
                 self.get_logger().info(
                     f"[{tag_source}] Dist: {dist_to_target:.2f}m | TgtAS: {target_airspeed:.2f} | AS: {airspeed:.2f} | "

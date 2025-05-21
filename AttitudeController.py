@@ -11,10 +11,10 @@ import threading
 import matplotlib.pyplot as plt
 import csv
 import os
-from geometry_msgs.msg import PoseStamped
-from apriltag_interfaces.msg import TagPoseStamped  # Make sure this is imported
+from apriltag_interfaces.msg import TagPoseStamped  # Your custom message
 
 # --- PID Controller ---
+
 class PID:
     def __init__(self, kp, ki, kd, integral_limit=None):
         self.kp = kp
@@ -64,27 +64,31 @@ class GpsFollower(Node):
         self.fixed_altitude = 10.0
         self.last_lat, self.last_lon = None, None
         self.uav_lat, self.uav_lon = None, None
+        self.prev_tag_source = "GPS"
         self.last_time = time.time()
         self.start_time = self.last_time
         self.latest_tags = {}
-        self.trajectory_duration = 10.0  # seconds
-        self.trajectory_target_alt = 3.0
-        self.trajectory_target_dist = 3.0
-        self.desired_distance = 15.0
-        self.prev_tag_source = "GPS"
-        self.trajectory_hold_duration = 20.0  # maintain 5m alt & dist for 20s
 
         self.prius_last_lat = None
         self.prius_last_lon = None
 
+
         # PID controllers
         self.airspeed_pid = PID(kp=0.08, ki=0.04, kd=0.0, integral_limit=5.0)
         self.altitude_pid = PID(kp=0.052, ki=0.0095, kd=0.25, integral_limit=5.5)
-        self.distance_pid = PID(kp=1.0, ki=0.0, kd=0.0, integral_limit=5.0)
-        self.lateral_pid = PID(kp=0.0011, ki=0.0006, kd=0.13, integral_limit=2.0)
+        #self.altitude_pid = PID(kp=0.065, ki=0.01, kd=0.05, integral_limit=4.5)
+        self.distance_pid = PID(kp=0.5, ki=0.0, kd=0.0, integral_limit=5.0)
+        #self.lateral_pid = PID(kp=0.0011, ki=0.0006, kd=0.13, integral_limit=2.0)
         #self.lateral_pid = PID(kp=0.0025, ki=0.0015, kd=1.7, integral_limit=1.0)
+        # Reduce P and D slightly, and lower I to reduce overshoot
+        #self.lateral_pid = PID(kp=0.0009, ki=0.000, kd=0.14, integral_limit=0.6)
+        self.lateral_pid = PID(kp=0.0013, ki=0.0014, kd=0.16, integral_limit=1.0)
+        #self.lateral_pid = PID(kp=0.00012, ki=0.00055, kd=0.228, integral_limit=0.6)
+        #self.lateral_pid = PID(kp=0.0018, ki=0.0007, kd=0.11, integral_limit=1.2)
 
-        self.target_heading_deg = 135.0  # Set desired heading here
+        self.car_heading_deg = 255.0  # Set desired heading here
+        self.heading_log = 0
+        self.car_heading_radians = math.radians(self.car_heading_deg) # in radians
         self.log_roll_cmd = []
         self.log_time = []
         self.log_distance_error = []
@@ -92,6 +96,9 @@ class GpsFollower(Node):
         self.log_altitude = []
         self.log_lateral_offset = []
         self.run_duration = 200.0  # seconds
+        self.trajectory_duration = 10.0  # seconds
+        self.trajectory_target_alt = 5.0
+        self.trajectory_hold_duration = 20.0  # maintain 5m alt & dist for 20s
 
         self.base_throttle = 0.55
         self.uav_was_ahead = False
@@ -108,6 +115,7 @@ class GpsFollower(Node):
 
         # Start threads
         self.start_attitude_thread()  # 100 Hz control loop
+        #self.start_autotuner_thread()
         self.start_gps_thread()       # 5 Hz GPS sending
 
     def warmup_throttle(self):
@@ -227,27 +235,25 @@ class GpsFollower(Node):
     def wrap_angle_rad(self, angle):
         """Wrap angle to [-π, π]"""
         return ((angle + math.pi) % (2 * math.pi)) - math.pi 
-    
-    def send_custom_l1_external_nav(self, xtrack_error, wp_distance, enable):
-        self.vehicle._master.mav.l1_external_nav_send(
-            xtrack_error,     # param1: cross-track error (left/right)
-            wp_distance,      # param2: distance to WP
-            enable            # param3: 1=enable, 0=disable
-        )
 
     def start_gps_thread(self):
         def send_goto_loop():
+            start_time = time.time()
             rate = 0.2  # 5 Hz
             while rclpy.ok():
                 if self.last_lat is not None:
-                    car_heading_rad = getattr(self, "last_car_heading", math.radians(self.target_heading_deg))
-                    target = LocationGlobalRelative(self.last_lat, self.last_lon, self.fixed_altitude)
-                    self.vehicle.simple_goto(target)
+                    elapsed = time.time() - start_time
+                    if elapsed >= 5.0:
+                        spoof_lat, spoof_lon = self.offset_gps(self.last_lat, self.last_lon, self.car_heading_radians, 50.0)
+                        self.vehicle.simple_goto(LocationGlobalRelative(spoof_lat, spoof_lon, self.fixed_altitude))
+                    else:
+                        self.vehicle.simple_goto(LocationGlobalRelative(self.last_lat, self.last_lon, self.fixed_altitude))
                 time.sleep(rate)
 
         thread = threading.Thread(target=send_goto_loop)
         thread.daemon = True
         thread.start()
+
 
     def attitude_loop(self):
         log_counter = 0
@@ -257,7 +263,7 @@ class GpsFollower(Node):
             self.last_time = now
             elapsed = now - self.start_time
 
-            if self.last_lat is None or self.last_lon is None or (now - self.start_time) < 23.0:
+            if self.last_lat is None or self.last_lon is None or (now - self.start_time) < 30.0:
                 time.sleep(0.01)
                 continue
 
@@ -268,7 +274,7 @@ class GpsFollower(Node):
             now = time.time()
             pose0, t0 = self.latest_tags.get(0, (None, 0.0))
             pose1, t1 = self.latest_tags.get(1, (None, 0.0))
-            desired_distance = 10.0 if elapsed < 100.0 else 6.0
+            desired_distance = 10.0 if elapsed < 100.0 else 0.0
 
             use_pose = None
             tag_source = "GPS"
@@ -291,95 +297,59 @@ class GpsFollower(Node):
                 use_pose = pose1
                 tag_source = "Stale AprilTag ID 1"
 
-
+            
             in_trajectory_phase = self.run_duration < elapsed <= self.run_duration + self.trajectory_duration
             in_hold_phase = self.run_duration + self.trajectory_duration < elapsed <= self.run_duration + self.trajectory_duration + self.trajectory_hold_duration
 
             if in_trajectory_phase:
                 traj_time = elapsed - self.run_duration
                 factor = min(traj_time / self.trajectory_duration, 1.0)
-                self.fixed_altitude = 10.0 - 3.0 * factor
-                self.desired_distance = 15.0 - 3.0 * factor
+                self.fixed_altitude = 10.0 - 5.0 * factor
+                self.desired_distance = 0
             elif in_hold_phase:
-                self.fixed_altitude = 3.0
-                self.desired_distance = 3.0
-            else:
+                self.fixed_altitude = 5.0
+                self.desired_distance = 0.0
+            else: 
                 self.fixed_altitude = 10.0
-                self.desired_distance = 15.0
-
-            # Use Tag or fallback to GPS
+                desired_distance = 10.0 if elapsed < 100.0 else 0.0  
+                    
             if use_pose is not None:
-                spoof_lat, spoof_lon = self.offset_gps(self.last_lat, self.last_lon, self.last_car_heading, 50.0)
-                # Replace vehicle.simple_goto or SET_POSITION_TARGET with this spoof
-                self.vehicle.simple_goto(LocationGlobalRelative(spoof_lat, spoof_lon, self.fixed_altitude))
                 tag_source = "AprilTag ID 0" if now - t0 < 0.5 else "AprilTag ID 1"
+                if "AprilTag" in tag_source:
+                    self.distance_pid.kp = 0.5
+                else:
+                    self.distance_pid.kp = 1.0
                 if self.prev_tag_source != tag_source:
                     self.distance_pid.integral = 0.0
                     self.distance_pid.last_error = 0.0
                 lateral_error = use_pose.pose.position.x
-                altitude_error = self.fixed_altitude - (self.vehicle.location.global_relative_frame.alt or 0.0)
+                if in_trajectory_phase:
+                    tag_altitude = use_pose.pose.position.y
+                    altitude_error = self.trajectory_target_alt + 1.76 -use_pose.pose.position.y
+                else:
+                    tag_altitude = use_pose.pose.position.y
+                    altitude_error = self.fixed_altitude + 1.76 - tag_altitude  # 1.76 is likely camera offset
                 distance_error = use_pose.pose.position.z - desired_distance
                 dist_to_target = use_pose.pose.position.z
+
             else:
                 tag_source = "GPS"
                 if self.prius_last_lat is not None and self.prius_last_lon is not None:
-                    car_move_dist = geodesic((self.prius_last_lat, self.prius_last_lon), (self.last_lat, self.last_lon)).meters
-                    if car_move_dist > 1.0:
-                        raw_car_heading = self.compute_bearing(
-                            self.prius_last_lat, self.prius_last_lon,
-                            self.last_lat, self.last_lon
-                        )
-                        if hasattr(self, "last_car_heading"):
-                            alpha = 0.9
-                            car_heading = alpha * self.last_car_heading + (1 - alpha) * raw_car_heading
-                        else:
-                            car_heading = raw_car_heading
-                        self.last_car_heading = car_heading
-                    else:
-                        car_heading = self.last_car_heading
-
-                    dist_to_target = self.projected_distance_along_heading(
-                        self.last_lat, self.last_lon, car_heading,
-                        self.uav_lat, self.uav_lon
-                    )
-                else:
                     dist_to_target = geodesic((self.uav_lat, self.uav_lon), (self.last_lat, self.last_lon)).meters
 
-                distance_error = dist_to_target - self.desired_distance
-                lateral_error = self.lateral_offset_error(self.last_lat, self.last_lon, car_heading, self.uav_lat, self.uav_lon)
+                distance_error = dist_to_target - desired_distance
+                lateral_error = self.lateral_offset_error(self.last_lat, self.last_lon, self.car_heading_radians, self.uav_lat, self.uav_lon)
                 altitude_error = self.fixed_altitude - (self.vehicle.location.global_relative_frame.alt or 0.0)
 
-            # --- Closure rate ---
-            if hasattr(self, "prev_dist"):
-                closure_rate = (dist_to_target - self.prev_dist) / dt
-            else:
-                closure_rate = 0.0
             self.prev_dist = dist_to_target
 
             if elapsed > self.run_duration + self.trajectory_duration + self.trajectory_hold_duration:
-                self.get_logger().info("✅ Run + Trajectory complete. Shutting down...")
+                self.get_logger().info("✅ Run complete. Shutting down...")
                 rclpy.shutdown()
                 break
 
             # --- Target airspeed with PID ---
             target_airspeed = 16.0 + self.distance_pid.update(distance_error, dt)  # baseline matching speed
-
-            # --- Smooth slow-down near target ---
-            if abs(distance_error) < 10.0 and closure_rate < -0.2:
-                decel = min(2.0, 0.25 * (10.0 - abs(distance_error)))
-                target_airspeed -= decel
-
-            # --- Dynamic braking zone ---
-            brake_zone = 25.0
-            if dist_to_target < brake_zone and closure_rate < -0.3:
-                brake_ratio = (brake_zone - dist_to_target) / brake_zone
-                throttle_cut = 1.1 * brake_ratio
-                target_airspeed *= max(0.0, (1.0 - throttle_cut))
-                target_airspeed = max(target_airspeed, 10.0)
-
-            # --- Hard clamp if very close and closing fast ---
-            if distance_error < 2.0 and closure_rate < -0.5:
-                target_airspeed = min(target_airspeed, 12.0)
 
             # --- Final clamp ---
             target_airspeed = max(10.0, min(target_airspeed, 22.0))
@@ -396,9 +366,9 @@ class GpsFollower(Node):
             throttle_cmd = max(0.0, min(throttle_cmd, 1.0))
 
             # --- Lateral Error to Roll Command ---
-            lateral_error = self.lateral_offset_error(self.last_lat, self.last_lon, car_heading, self.uav_lat, self.uav_lon)
+            lateral_error = self.lateral_offset_error(self.last_lat, self.last_lon, self.car_heading_radians, self.uav_lat, self.uav_lon)
             roll_cmd = self.lateral_pid.update(lateral_error, dt)
-            roll_cmd = max(min(roll_cmd, math.radians(3.0)), math.radians(-3.0))
+            roll_cmd = max(min(roll_cmd, math.radians(10)), math.radians(-10))
 
             if math.isfinite(altitude):
                 elapsed = now - self.start_time
@@ -409,8 +379,8 @@ class GpsFollower(Node):
                 self.log_roll_cmd.append(math.degrees(roll_cmd))
                 self.log_lateral_offset.append(lateral_error)
 
-            # --- Attitude Command ---
-            q = euler_to_quaternion(32767, pitch_cmd, 0.0)
+            #--- Attitude Command ---#
+            q = euler_to_quaternion(roll_cmd, pitch_cmd, 0.0)
             self.vehicle._master.mav.set_attitude_target_send(
                 int((now - self.start_time) * 1000),
                 self.vehicle._master.target_system,
@@ -420,6 +390,40 @@ class GpsFollower(Node):
                 0.0, 0.0, 0.0,
                 throttle_cmd
             )
+
+            # self.vehicle._master.mav.command_long_send(
+            #     self.vehicle._master.target_system,
+            #     self.vehicle._master.target_component,
+            #     mavutil.mavlink.MAV_CMD_DO_CHANGE_SPEED,
+            #     0,
+            #     0,  # Airspeed
+            #     target_airspeed,
+            #     -1, 0, 0, 0, 0
+            # )
+
+            # # --- Send MAVLINK_MSG_ID_SET_TECS_EXTERNAL_NAV (ID 187) ---
+            # self.vehicle._master.mav.command_int_send(
+            #     self.vehicle._master.target_system,
+            #     self.vehicle._master.target_component,
+            #     mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+            #     43008,  # MAV_CMD_SET_TECS_EXTERNAL_NAV
+            #     0, 0,     # confirmation
+            #     float(target_airspeed),  # ✅ param1: desired EAS in m/s
+            #     float(self.fixed_altitude),  # ✅ param2: desired altitude (AGL)
+            #     1, 0, 0, 0, 0                         # param3 = enable, rest unused
+            # )
+            # self.vehicle._master.mav.command_long_send(
+            #     self.vehicle._master.target_system,
+            #     self.vehicle._master.target_component,
+            #     43008,  # MAV_CMD_SET_TECS_EXTERNAL_NAV
+            #     0,
+            #     float(target_airspeed),  # ✅ param1: desired EAS in m/s
+            #     float(self.fixed_altitude),  # ✅ param2: desired altitude (AGL)
+            #     1, 0, 0, 0, 0             # param3 = enable, rest unused
+            # )
+
+            # --- Compute spoofed forward distance (fake L1) ---
+            # car_heading = self.car_heading_radians if hasattr(self, "car_heading_radians") else math.radians(self.target_heading_deg)
             spoofed_forward_distance = 500 # push target 40m ahead for L1 logic
             # # --- Send MAV_CMD_SET_L1_EXTERNAL_NAV ---
             # self.vehicle._master.mav.command_int_send(
@@ -437,13 +441,23 @@ class GpsFollower(Node):
 
             self.send_custom_l1_external_nav(float(lateral_error), float(spoofed_forward_distance), 1)
 
+
+
+# Compute spoofed GPS 20m ahead of car for display only
+            self.heading_log = self.car_heading_deg
+            if hasattr(self, "car_heading_radians"):
+                spoof_lat, spoof_lon = self.offset_gps(self.last_lat, self.last_lon, self.car_heading_radians, 30.0)
+            else:
+                spoof_lat, spoof_lon = None, None
             if log_counter % 10 == 0:
                 self.get_logger().info(
                     f"[{tag_source}] Dist: {dist_to_target:.2f}m | TgtAS: {target_airspeed:.2f} | AS: {airspeed:.2f} | "
                     f"Alt: {altitude:.2f} | Throttle: {throttle_cmd:.2f} | Pitch(deg): {math.degrees(pitch_cmd):.2f} | "
                     f"Lateral Offset: {lateral_error:.2f}m | RollCmd: {math.degrees(roll_cmd):.2f}°"
+                    f"Bearing Car: {self.heading_log:.2f}° | "
                 )
             log_counter += 1
+            
             time.sleep(0.01)
 
     def compute_bearing(self, lat1, lon1, lat2, lon2):
@@ -458,11 +472,93 @@ class GpsFollower(Node):
         y = math.cos(lat1) * math.sin(lat2) - (math.sin(lat1) * math.cos(lat2) * math.cos(dLon))
         bearing = math.atan2(x, y)
         return bearing  # in radians
+    
+    def send_custom_l1_external_nav(self, xtrack_error, wp_distance, enable):
+        self.vehicle._master.mav.l1_external_nav_send(
+            xtrack_error,     # param1: cross-track error (left/right)
+            wp_distance,      # param2: distance to WP
+            enable            # param3: 1=enable, 0=disable
+        )
 
     def start_attitude_thread(self):
         thread = threading.Thread(target=self.attitude_loop)
         thread.daemon = True
         thread.start()
+
+    def start_autotuner_thread(self):
+        thread = threading.Thread(target=self.lateral_pid_autotune_loop)
+        thread.daemon = True
+        thread.start()
+
+    def lateral_pid_autotune_loop(self):
+        kp, ki, kd = self.lateral_pid.kp, self.lateral_pid.ki, self.lateral_pid.kd
+        deltas = {"kp": 0.0001, "ki": 0.00005, "kd": 0.001}
+        history = []
+
+        start_autotune = time.time()
+        max_duration = self.run_duration + 10.0  # 🕒 Run slightly longer than mission
+        stale_count = 0
+        max_stale_rounds = 3
+        min_improvement = 0.01  # Must improve by at least this much
+
+        while rclpy.ok():
+            if time.time() - start_autotune > max_duration:
+                print("[Autotune] ⏹ Stopping after max duration.")
+                break
+
+            time.sleep(10.0)
+
+            if len(self.log_lateral_offset) < 200:
+                continue
+
+            # 📈 Score current gain setup
+            error = sum(abs(e) for e in self.log_lateral_offset[-200:]) / 200.0
+            print(f"[Autotune] Current error: {error:.4f}")
+            history.append((kp, ki, kd, error))
+            if len(history) > 5:
+                history.pop(0)
+
+            best_score = error
+            best_gains = (kp, ki, kd)
+
+            for param in ["kp", "ki", "kd"]:
+                for direction in [-1, 1]:
+                    test_kp = kp + direction * deltas["kp"] if param == "kp" else kp
+                    test_ki = ki + direction * deltas["ki"] if param == "ki" else ki
+                    test_kd = kd + direction * deltas["kd"] if param == "kd" else kd
+
+                    self.lateral_pid.set_gains(test_kp, test_ki, test_kd)
+                    time.sleep(5.0)
+
+                    # 🔁 Score new config
+                    score = sum(abs(e) for e in self.log_lateral_offset[-100:]) / 100.0
+
+                    if score < best_score:
+                        best_score = score
+                        best_gains = (test_kp, test_ki, test_kd)
+                        print(f"[TUNE] ✅ Better gain: kp={test_kp}, ki={test_ki}, kd={test_kd} → score={score:.4f}")
+
+            # 📉 Check for improvement
+            if best_score < error - min_improvement:
+                stale_count = 0
+            else:
+                stale_count += 1
+                print(f"[Autotune] ⚠️ No significant improvement. ({stale_count}/{max_stale_rounds})")
+
+            if stale_count >= max_stale_rounds:
+                print("[Autotune] 🛑 No improvement over several rounds. Stopping.")
+                break
+
+            # ✅ Apply best gains
+            kp, ki, kd = best_gains
+            self.lateral_pid.set_gains(kp, ki, kd)
+            print(f"[TUNE] Applying: kp={kp}, ki={ki}, kd={kd}")
+
+            # 💾 Log to CSV
+            with open("live_autotune_log.csv", "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([time.time(), kp, ki, kd, best_score])
+
 
     def speed_profile(self, dist, max_speed=25.0, min_speed=15.0, slowdown_radius=100.0):
         if dist > slowdown_radius:
@@ -532,7 +628,7 @@ def main(args=None):
         csv_filename = "lateral_roll_data.csv"
         with open(csv_filename, mode='w', newline='') as file:
             writer = csv.writer(file)
-            writer.writerow(["Time (s)", "Lateral Offset (m)", "Roll Command (deg)"])
+            writer.writerow(["Time (s)", "Lateral Offset (m)", "Roll Command (deg)", "car heading"])
             for t, offset, roll in zip(gps_follower.log_time, gps_follower.log_lateral_offset, gps_follower.log_roll_cmd):
                 writer.writerow([t, offset, roll])
         print(f"✅ CSV saved to: {os.path.abspath(csv_filename)}")
@@ -541,7 +637,7 @@ def main(args=None):
         import matplotlib.pyplot as plt
         plt.figure(figsize=(10, 5))
         plt.plot(gps_follower.log_time, gps_follower.log_actual_distance, label="UAV Distance to Car (m)")
-        plt.axhline(gps_follower.desired_distance, linestyle='--', color='gray', label="Target Distance (10m)")
+        plt.axhline(10.0, linestyle='--', color='gray', label="Target Distance (10m)")
         plt.xlabel("Time (s)")
         plt.ylabel("Distance (m)")
         plt.title("UAV Following Distance Over Time")
