@@ -98,7 +98,7 @@ class GpsFollower(Node):
         self.airspeed_pid = PID(kp=0.08, ki=0.04, kd=0.0, integral_limit=5.0)
         self.altitude_pid = PID(kp=0.052, ki=0.0095, kd=0.25, integral_limit=5.5)
         #self.altitude_pid = PID(kp=0.065, ki=0.01, kd=0.05, integral_limit=4.5)
-        self.distance_pid = PID(kp=1.0, ki=0.0, kd=0.0, integral_limit=5.0)
+        self.distance_pid = PID(kp=0.1, ki=0.0, kd=0.0, integral_limit=5.0)
         #self.lateral_pid = PID(kp=0.0011, ki=0.0006, kd=0.13, integral_limit=2.0)
         #self.lateral_pid = PID(kp=0.0025, ki=0.0015, kd=1.7, integral_limit=1.0)
         # Reduce P and D slightly, and lower I to reduce overshoot
@@ -107,8 +107,9 @@ class GpsFollower(Node):
         #self.lateral_pid = PID(kp=0.00012, ki=0.00055, kd=0.228, integral_limit=0.6)
         #self.lateral_pid = PID(kp=0.0018, ki=0.0007, kd=0.11, integral_limit=1.2)
 
-        self.target_heading_deg = 105.5  # Set desired heading here
-        self.last_car_heading = math.radians(self.target_heading_deg)
+        self.car_heading_deg = 255.0  # Set desired heading here
+        self.heading_log = 0
+        self.car_heading_radians = math.radians(self.car_heading_deg) # in radians
         self.log_roll_cmd = []
         self.log_time = []
         self.log_distance_error = []
@@ -368,18 +369,14 @@ class GpsFollower(Node):
             while rclpy.ok():
                 if self.last_lat is not None:
                     elapsed = time.time() - start_time
-
-                    car_heading_rad = getattr(self, "last_car_heading", math.radians(self.target_heading_deg))
-
                     if elapsed >= 5.0:
-                        spoof_lat, spoof_lon = self.offset_gps(self.last_lat, self.last_lon, self.last_car_heading, 50.0)
-                        # Replace vehicle.simple_goto or SET_POSITION_TARGET with this spoof
+                        spoof_lat, spoof_lon = self.offset_gps(self.last_lat, self.last_lon, self.car_heading_radians, 50.0)
                         self.vehicle.simple_goto(LocationGlobalRelative(spoof_lat, spoof_lon, self.fixed_altitude))
                     else:
-                        spoof_lat, spoof_lon = self.last_lat, self.last_lon
+                        self.vehicle.simple_goto(LocationGlobalRelative(self.last_lat, self.last_lon, self.fixed_altitude))
 
-                    target = LocationGlobalRelative(self.last_lat, self.last_lon, self.fixed_altitude)
-                    self.vehicle.simple_goto(target)
+                    # target = LocationGlobalRelative(self.last_lat, self.last_lon, self.fixed_altitude)
+                    # self.vehicle.simple_goto(target)
                 time.sleep(rate)
 
         thread = threading.Thread(target=send_goto_loop)
@@ -406,7 +403,7 @@ class GpsFollower(Node):
             now = time.time()
             pose0, t0 = self.latest_tags.get(0, (None, 0.0))
             pose1, t1 = self.latest_tags.get(1, (None, 0.0))
-            desired_distance = 10.0 if elapsed < 100.0 else 6.0
+            desired_distance = 10.0 if elapsed < 100.0 else 0.0
 
             use_pose = None
             tag_source = "GPS"
@@ -428,11 +425,9 @@ class GpsFollower(Node):
             elif t1 > t0 and (now - t1) < 1.5:
                 use_pose = pose1
                 tag_source = "Stale AprilTag ID 1"
-
+            
             if use_pose is not None:
-                spoof_lat, spoof_lon = self.offset_gps(self.last_lat, self.last_lon, self.last_car_heading, 50.0)
-                # Replace vehicle.simple_goto or SET_POSITION_TARGET with this spoof
-                self.vehicle.simple_goto(LocationGlobalRelative(spoof_lat, spoof_lon, self.fixed_altitude))
+                
                 tag_source = "AprilTag ID 0" if now - t0 < 0.5 else "AprilTag ID 1"
                 if self.prev_tag_source != tag_source:
                     self.distance_pid.integral = 0.0
@@ -445,30 +440,10 @@ class GpsFollower(Node):
             else:
                 tag_source = "GPS"
                 if self.prius_last_lat is not None and self.prius_last_lon is not None:
-                    car_move_dist = geodesic((self.prius_last_lat, self.prius_last_lon), (self.last_lat, self.last_lon)).meters
-                    if car_move_dist > 1.0:
-                        raw_car_heading = self.compute_bearing(
-                            self.prius_last_lat, self.prius_last_lon,
-                            self.last_lat, self.last_lon
-                        )
-                        if hasattr(self, "last_car_heading"):
-                            alpha = 0.9
-                            car_heading = alpha * self.last_car_heading + (1 - alpha) * raw_car_heading
-                        else:
-                            car_heading = raw_car_heading
-                        self.last_car_heading = car_heading
-                    else:
-                        car_heading = self.last_car_heading
-
-                    dist_to_target = self.projected_distance_along_heading(
-                        self.last_lat, self.last_lon, car_heading,
-                        self.uav_lat, self.uav_lon
-                    )
-                else:
                     dist_to_target = geodesic((self.uav_lat, self.uav_lon), (self.last_lat, self.last_lon)).meters
 
                 distance_error = dist_to_target - desired_distance
-                lateral_error = self.lateral_offset_error(self.last_lat, self.last_lon, car_heading, self.uav_lat, self.uav_lon)
+                lateral_error = self.lateral_offset_error(self.last_lat, self.last_lon, self.car_heading_radians, self.uav_lat, self.uav_lon)
                 altitude_error = self.fixed_altitude - (self.vehicle.location.global_relative_frame.alt or 0.0)
 
             self.prev_dist = dist_to_target
@@ -496,7 +471,7 @@ class GpsFollower(Node):
             throttle_cmd = max(0.0, min(throttle_cmd, 1.0))
 
             # --- Lateral Error to Roll Command ---
-            lateral_error = self.lateral_offset_error(self.last_lat, self.last_lon, car_heading, self.uav_lat, self.uav_lon)
+            lateral_error = self.lateral_offset_error(self.last_lat, self.last_lon, self.car_heading_radians, self.uav_lat, self.uav_lon)
             roll_cmd = self.lateral_pid.update(lateral_error, dt)
             roll_cmd = max(min(roll_cmd, math.radians(10)), math.radians(-10))
 
@@ -553,7 +528,7 @@ class GpsFollower(Node):
             # )
 
             # --- Compute spoofed forward distance (fake L1) ---
-            # car_heading = self.last_car_heading if hasattr(self, "last_car_heading") else math.radians(self.target_heading_deg)
+            # car_heading = self.car_heading_radians if hasattr(self, "car_heading_radians") else math.radians(self.target_heading_deg)
             spoofed_forward_distance = 500 # push target 40m ahead for L1 logic
             # # --- Send MAV_CMD_SET_L1_EXTERNAL_NAV ---
             # self.vehicle._master.mav.command_int_send(
@@ -574,8 +549,9 @@ class GpsFollower(Node):
 
 
 # Compute spoofed GPS 20m ahead of car for display only
-            if hasattr(self, "last_car_heading"):
-                spoof_lat, spoof_lon = self.offset_gps(self.last_lat, self.last_lon, self.last_car_heading, 30.0)
+            self.heading_log = self.car_heading_deg
+            if hasattr(self, "car_heading_radians"):
+                spoof_lat, spoof_lon = self.offset_gps(self.last_lat, self.last_lon, self.car_heading_radians, 30.0)
             else:
                 spoof_lat, spoof_lon = None, None
             if log_counter % 10 == 0:
@@ -583,7 +559,7 @@ class GpsFollower(Node):
                     f"[{tag_source}] Dist: {dist_to_target:.2f}m | TgtAS: {target_airspeed:.2f} | AS: {airspeed:.2f} | "
                     f"Alt: {altitude:.2f} | Throttle: {throttle_cmd:.2f} | Pitch(deg): {math.degrees(pitch_cmd):.2f} | "
                     f"Lateral Offset: {lateral_error:.2f}m | RollCmd: {math.degrees(roll_cmd):.2f}°"
-                    f"Bearing Car: {math.degrees(car_heading):.2f}° | "
+                    f"Bearing Car: {self.heading_log:.2f}° | "
                 )
             log_counter += 1
             
@@ -757,7 +733,7 @@ def main(args=None):
         csv_filename = "lateral_roll_data.csv"
         with open(csv_filename, mode='w', newline='') as file:
             writer = csv.writer(file)
-            writer.writerow(["Time (s)", "Lateral Offset (m)", "Roll Command (deg)"])
+            writer.writerow(["Time (s)", "Lateral Offset (m)", "Roll Command (deg)", "car heading"])
             for t, offset, roll in zip(gps_follower.log_time, gps_follower.log_lateral_offset, gps_follower.log_roll_cmd):
                 writer.writerow([t, offset, roll])
         print(f"✅ CSV saved to: {os.path.abspath(csv_filename)}")
