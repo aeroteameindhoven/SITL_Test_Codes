@@ -60,13 +60,22 @@ class GpsFollower(Node):
 
         self.last_apriltag_time = 0.0
         self.latest_apriltag_pose = None
-        self.fixed_altitude = 10.0
+        self.fixed_altitude = 8.0
         self.last_lat, self.last_lon = None, None
         self.uav_lat, self.uav_lon = None, None
         self.prev_tag_source = "GPS"
         self.last_time = time.time()
         self.start_time = self.last_time
         self.latest_tags = {}
+        self.in_trajectory_phase = False
+        self.trajectory_duration = 8.0
+        self.trajectory_hold_duration = 20.0
+        self.trajectory_started = False
+        self.trajectory_start_time = None
+        self.distance_under_threshold_time = None
+        self.distance_trigger_threshold = 1.0 
+        self.wait_before_trajectory = 5.0  # seconds under threshold before starting
+        
 
         self.prius_last_lat = None
         self.prius_last_lon = None
@@ -74,8 +83,9 @@ class GpsFollower(Node):
 
         # PID controllers
         self.airspeed_pid = PID(kp=0.08, ki=0.04, kd=0.0, integral_limit=5.0)
-        self.altitude_pid = PID(kp=0.052, ki=0.0095, kd=0.25, integral_limit=5.5)
-        self.distance_pid = PID(kp=0.1, ki=0.0, kd=0.0, integral_limit=5.0)
+        self.altitude_pid = PID(kp=0.022, ki=0.0095, kd=0.65, integral_limit=5.5)
+        # self.altitude_pid = PID(kp=0.052, ki=0.0095, kd=0.25, integral_limit=5.5) worked well but not for docking with one set point
+        self.distance_pid = PID(kp=0.5, ki=0.0, kd=0.0, integral_limit=5.0)
         self.lateral_pid = PID(kp=0.0013, ki=0.0014, kd=0.16, integral_limit=1.0)
     
         self.car_heading_deg = 255.0  # Set desired heading here
@@ -87,6 +97,7 @@ class GpsFollower(Node):
         self.log_actual_distance = []
         self.log_altitude = []
         self.log_lateral_offset = []
+        self.log_tag_height = []  # CV-estimated height from tag (pose.position.y)
         self.run_duration = 1500.0  # seconds
 
         self.base_throttle = 0.55
@@ -265,7 +276,8 @@ class GpsFollower(Node):
             altitude = self.vehicle.location.global_relative_frame.alt or 0.0
             airspeed = self.vehicle.airspeed or 0.0
             now = time.time()
-            desired_distance = 10.0 if elapsed < 100.0 else 0.0
+            
+            
             use_pose = None
             tag_source = "GPS"
             valid_time_window = 1.0  # seconds
@@ -290,13 +302,66 @@ class GpsFollower(Node):
                         use_pose = pose
                         tag_source = f"Stale AprilTag ID {tag_id}"
                         break
+            
+            in_trajectory_phase = False
+            in_hold_phase = False
+            desired_distance = 0
+            desired_height = None
+            if use_pose and not self.trajectory_started:
+                if use_pose.pose.position.z < self.distance_trigger_threshold:
+                    if self.distance_under_threshold_time is None:
+                        self.distance_under_threshold_time = now
+                    elif now - self.distance_under_threshold_time > self.wait_before_trajectory:
+                        self.trajectory_started = True
+                        self.trajectory_start_time = now
+                        self.get_logger().info("Trajectory Triggered")
+                else:
+                    self.distance_under_threshold_time = None
+            if self.trajectory_started:
+                time_since_traj = now - self.trajectory_start_time
+                in_trajectory_phase = time_since_traj < self.trajectory_duration
+                in_hold_phase = self.trajectory_duration < time_since_traj < (self.trajectory_duration + self.trajectory_hold_duration)
+
+            if (in_trajectory_phase or in_hold_phase) and use_pose is None:
+                self.get_logger().warn("⚠️ AprilTag lost during trajectory/hold phase — reverting to GPS mode.")
+                self.trajectory_started = False
+                self.trajectory_start_time = None
+                self.distance_under_threshold_time = None
+                in_trajectory_phase = False
+                in_hold_phase = False
+            
+            if in_trajectory_phase:
+                desired_distance = 0.0 
+                if time_since_traj < 1:
+                    desired_height = None
+                elif time_since_traj < 2:
+                    desired_height = 5
+                elif time_since_traj <3:
+                    desired_height = 4
+                elif time_since_traj <4:
+                    desired_height = 3.5
+                elif time_since_traj <5:
+                    desired_height = 3
+                elif time_since_traj < 6:
+                    desired_height = 2.7
+                elif time_since_traj < 7:
+                    desired_height = 2.3
+                else:
+                    desired_height = 2
+            
+            if in_hold_phase:
+                desired_height = 2.0
 
             if use_pose is not None:
+                self.distance_pid.kp = 0.1  # Lower gain when tag is seen
                 if self.prev_tag_source != tag_source:
                     self.distance_pid.integral = 0.0
                     self.distance_pid.last_error = 0.0
                 lateral_error = use_pose.pose.position.x
-                altitude_error = self.fixed_altitude - (self.vehicle.location.global_relative_frame.alt or 0.0)
+                if desired_height is None:
+                    altitude_error = self.fixed_altitude - (1.76 + use_pose.pose.position.y)
+                else:
+                    altitude_error = desired_height - use_pose.pose.position.y 
                 distance_error = use_pose.pose.position.z - desired_distance
                 dist_to_target = use_pose.pose.position.z
             else:
@@ -344,6 +409,9 @@ class GpsFollower(Node):
                 self.log_altitude.append(altitude)
                 self.log_roll_cmd.append(math.degrees(roll_cmd))
                 self.log_lateral_offset.append(lateral_error)
+            
+            tag_height_str = f"{use_pose.pose.position.y:.2f}m" if use_pose is not None else "N/A"
+            tag_lateral_str = f"{use_pose.pose.position.x:.2f}m" if use_pose is not None else "N/A"
 
             #--- Attitude Command ---#
             q = euler_to_quaternion(roll_cmd, pitch_cmd, 0.0)
@@ -374,10 +442,18 @@ class GpsFollower(Node):
             self.send_custom_l1_external_nav(float(lateral_error), float(spoofed_forward_distance), 1)
 
             if log_counter % 10 == 0:
+                if in_trajectory_phase:
+                    flight_phase = "DESCENT"
+                elif in_hold_phase:
+                    flight_phase = "HOLD"
+                else:
+                    flight_phase = "NORMAL"
+
                 self.get_logger().info(
-                    f"[{tag_source}] Dist: {dist_to_target:.2f}m | TgtAS: {target_airspeed:.2f} | AS: {airspeed:.2f} | "
+                    f"[{tag_source}] Phase: {flight_phase} | Dist: {dist_to_target:.2f}m | TgtAS: {target_airspeed:.2f} | AS: {airspeed:.2f} | "
                     f"Alt: {altitude:.2f} | Throttle: {throttle_cmd:.2f} | Pitch(deg): {math.degrees(pitch_cmd):.2f} | "
-                    f"Lateral Offset: {lateral_error:.2f}m | RollCmd: {math.degrees(roll_cmd):.2f}°"
+                    f"Lateral Offset: {lateral_error:.2f}m | RollCmd: {math.degrees(roll_cmd):.2f}° | "
+                    f"TagHeight: {tag_height_str} | Bearing Car: {self.heading_log:.2f}° | TagLateral: {tag_lateral_str} | "
                 )
             log_counter += 1
             

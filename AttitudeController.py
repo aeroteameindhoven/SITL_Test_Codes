@@ -61,14 +61,13 @@ class GpsFollower(Node):
 
         self.last_apriltag_time = 0.0
         self.latest_apriltag_pose = None
-        self.fixed_altitude = 10.0
+        self.fixed_altitude = 8.0
         self.last_lat, self.last_lon = None, None
         self.uav_lat, self.uav_lon = None, None
         self.prev_tag_source = "GPS"
         self.last_time = time.time()
         self.start_time = self.last_time
         self.latest_tags = {}
-
         self.prius_last_lat = None
         self.prius_last_lon = None
 
@@ -98,7 +97,12 @@ class GpsFollower(Node):
         self.run_duration = 200.0  # seconds
         self.trajectory_duration = 10.0  # seconds
         self.trajectory_target_alt = 5.0
-        self.trajectory_hold_duration = 20.0  # maintain 5m alt & dist for 20s
+        self.trajectory_hold_duration = 20.0 
+        self.trajectory_started = False
+        self.trajectory_start_time = None
+        self.distance_under_threshold_time = None
+        self.distance_trigger_threshold = 1.0 
+        self.wait_before_trajectory = 5.0  # seconds under threshold before starting
 
         self.base_throttle = 0.55
         self.uav_was_ahead = False
@@ -263,7 +267,7 @@ class GpsFollower(Node):
             self.last_time = now
             elapsed = now - self.start_time
 
-            if self.last_lat is None or self.last_lon is None or (now - self.start_time) < 30.0:
+            if self.last_lat is None or self.last_lon is None or (now - self.start_time) < 23:
                 time.sleep(0.01)
                 continue
 
@@ -274,7 +278,7 @@ class GpsFollower(Node):
             now = time.time()
             pose0, t0 = self.latest_tags.get(0, (None, 0.0))
             pose1, t1 = self.latest_tags.get(1, (None, 0.0))
-            desired_distance = 10.0 if elapsed < 100.0 else 0.0
+            desired_distance = 0.0
 
             use_pose = None
             tag_source = "GPS"
@@ -297,22 +301,38 @@ class GpsFollower(Node):
                 use_pose = pose1
                 tag_source = "Stale AprilTag ID 1"
 
-            
-            in_trajectory_phase = self.run_duration < elapsed <= self.run_duration + self.trajectory_duration
-            in_hold_phase = self.run_duration + self.trajectory_duration < elapsed <= self.run_duration + self.trajectory_duration + self.trajectory_hold_duration
+            in_trajectory_phase = False
+            in_hold_phase = False
+
+            # Check if tag is available and trajectory not yet started
+            if use_pose and not self.trajectory_started:
+                if use_pose.pose.position.z < self.distance_trigger_threshold:
+                    if self.distance_under_threshold_time is None:
+                        self.distance_under_threshold_time = now
+                    elif now - self.distance_under_threshold_time > self.wait_before_trajectory:
+                        self.trajectory_started = True
+                        self.trajectory_start_time = now
+                        self.get_logger().info("Trajectory Triggered")
+                else:
+                    self.distance_under_threshold_time = None
+
+            if self.trajectory_started:
+                time_since_traj = now - self.trajectory_start_time
+                in_trajectory_phase = time_since_traj < self.trajectory_duration
+                in_hold_phase = self.trajectory_duration < time_since_traj < (self.trajectory_duration + self.trajectory_hold_duration)
 
             if in_trajectory_phase:
-                traj_time = elapsed - self.run_duration
+                traj_time = now - self.trajectory_start_time
                 factor = min(traj_time / self.trajectory_duration, 1.0)
-                self.fixed_altitude = 10.0 - 5.0 * factor
+                desired_height = (8 + 1.76) - 1.0 * factor
                 self.desired_distance = 0
             elif in_hold_phase:
-                self.fixed_altitude = 5.0
+                desired_height = 1
                 self.desired_distance = 0.0
             else: 
-                self.fixed_altitude = 10.0
-                desired_distance = 10.0 if elapsed < 100.0 else 0.0  
-                    
+                self.fixed_altitude = 8.0
+                desired_height = None
+                desired_distance = 0
             if use_pose is not None:
                 tag_source = "AprilTag ID 0" if now - t0 < 0.5 else "AprilTag ID 1"
                 if "AprilTag" in tag_source:
@@ -324,11 +344,12 @@ class GpsFollower(Node):
                     self.distance_pid.last_error = 0.0
                 lateral_error = use_pose.pose.position.x
                 if in_trajectory_phase:
-                    tag_altitude = use_pose.pose.position.y
-                    altitude_error = self.trajectory_target_alt + 1.76 -use_pose.pose.position.y
+                    altitude_error = desired_height - use_pose.pose.position.y
+                if in_hold_phase:
+                    altitude_error = desired_height - use_pose.pose.position.y
                 else:
                     tag_altitude = use_pose.pose.position.y
-                    altitude_error = self.fixed_altitude + 1.76 - tag_altitude  # 1.76 is likely camera offset
+                    altitude_error = self.fixed_altitude + 1.76 - tag_altitude
                 distance_error = use_pose.pose.position.z - desired_distance
                 dist_to_target = use_pose.pose.position.z
 
@@ -355,7 +376,6 @@ class GpsFollower(Node):
             target_airspeed = max(10.0, min(target_airspeed, 22.0))
 
             # --- Altitude + Pitch ---
-            altitude_error = self.fixed_altitude - altitude
             pitch_cmd = self.altitude_pid.update(altitude_error, dt)
             pitch_cmd = max(min(pitch_cmd, math.radians(15)), math.radians(-15))
 
@@ -366,7 +386,6 @@ class GpsFollower(Node):
             throttle_cmd = max(0.0, min(throttle_cmd, 1.0))
 
             # --- Lateral Error to Roll Command ---
-            lateral_error = self.lateral_offset_error(self.last_lat, self.last_lon, self.car_heading_radians, self.uav_lat, self.uav_lon)
             roll_cmd = self.lateral_pid.update(lateral_error, dt)
             roll_cmd = max(min(roll_cmd, math.radians(10)), math.radians(-10))
 
@@ -450,16 +469,26 @@ class GpsFollower(Node):
             else:
                 spoof_lat, spoof_lon = None, None
             if log_counter % 10 == 0:
+                if in_trajectory_phase:
+                    flight_phase = "DESCENT"
+                elif in_hold_phase:
+                    flight_phase = "HOLD"
+                else:
+                    flight_phase = "NORMAL"
+
                 self.get_logger().info(
-                    f"[{tag_source}] Dist: {dist_to_target:.2f}m | TgtAS: {target_airspeed:.2f} | AS: {airspeed:.2f} | "
+                    f"[{tag_source}] Phase: {flight_phase} | Dist: {dist_to_target:.2f}m | TgtAS: {target_airspeed:.2f} | AS: {airspeed:.2f} | "
                     f"Alt: {altitude:.2f} | Throttle: {throttle_cmd:.2f} | Pitch(deg): {math.degrees(pitch_cmd):.2f} | "
-                    f"Lateral Offset: {lateral_error:.2f}m | RollCmd: {math.degrees(roll_cmd):.2f}°"
-                    f"Bearing Car: {self.heading_log:.2f}° | "
+                    f"Lateral Offset: {lateral_error:.2f}m | RollCmd: {math.degrees(roll_cmd):.2f}° | "
+                    f"Bearing Car: {self.heading_log:.2f}°"
                 )
             log_counter += 1
-            
             time.sleep(0.01)
 
+    def connect_vehicle(self):
+        self.get_logger().info(f"Connecting to vehicle at {self.serial_path}...")
+        self.vehicle = connect(self.serial_path)
+        self.get_logger().info(f"Connected! Firmware: {self.vehicle.version}")
     def compute_bearing(self, lat1, lon1, lat2, lon2):
         """
         Compute the bearing from (lat1, lon1) to (lat2, lon2) in radians.
